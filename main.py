@@ -9,10 +9,13 @@ from lxml import etree
 from tqdm import tqdm
 import os
 from time import sleep
+from requests.adapters import HTTPAdapter
+
 from datetime import date, datetime, timedelta
 
 from util import csvutil
 from util.log import logger
+from util.html_parser import MyHTMLParser
 
 DATEFORMAT = "%Y-%m-%dT%H:%M:%S"
 
@@ -474,15 +477,11 @@ class WeiBoSpider(object):
 		text_body = weibo_info["text"]
 		selector = etree.HTML(f"{text_body}<hr>" if text_body.isspace() else text_body)
 		if self.remove_html_tag:
-			text_list = selector.xpath("//text()")
-			# 若text_list中的某个字符串元素以 @ 或 # 开始，则将该元素与前后元素合并为新元素，否则会带来没有必要的换行
-			text_list_modified = []
-			for ele in range(len(text_list)):
-				if ele > 0 and (text_list[ele - 1].startswith(('@', '#')) or text_list[ele].startswith(('@', '#'))):
-					text_list_modified[-1] += text_list[ele]
-				else:
-					text_list_modified.append(text_list[ele])
-			weibo["text"] = "\n".join(text_list_modified)
+			parser = MyHTMLParser()
+			parser.feed(text_body)
+			text_body = parser.get_text()
+			weibo["text"] = text_body
+		
 		else:
 			weibo["text"] = text_body
 		weibo["article_url"] = self.get_article_url(selector)
@@ -779,7 +778,7 @@ class WeiBoSpider(object):
 				+ dir_name
 			)
 			if write_type == "img" or write_type == "video":
-				file_dir = file_dir + os.sep + type
+				file_dir = file_dir + os.sep + write_type
 			if not os.path.isdir(file_dir):
 				os.makedirs(file_dir)
 			if write_type == "img" or write_type == "video":
@@ -866,6 +865,123 @@ class WeiBoSpider(object):
 			logger.info("%s 信息写入csv文件完毕，保存路径:", self.user["screen_name"])
 		logger.info(file_path)
 	
+	def download_files(self, file_type, weibo_type, wrote_count):
+		"""下载文件(图片/视频)"""
+		try:
+			describe = ""
+			if file_type == "img":
+				describe = "图片"
+				key = "pics"
+			else:
+				describe = "视频"
+				key = "video_url"
+			if weibo_type == "original":
+				describe = "原创微博" + describe
+			else:
+				describe = "转发微博" + describe
+			logger.info("即将进行%s下载", describe)
+			file_dir = self.get_filepath(file_type)
+			file_dir = file_dir + os.sep + describe
+			if not os.path.isdir(file_dir):
+				os.makedirs(file_dir)
+			for w in tqdm(self.weibo[wrote_count:], desc="Download progress"):
+				if weibo_type == "retweet":
+					if w.get("retweet"):
+						w = w["retweet"]
+					else:
+						continue
+				if w.get(key):
+					self.handle_download(file_type, file_dir, w.get(key), w)
+			logger.info("%s下载完毕,保存路径:", describe)
+			logger.info(file_dir)
+		except Exception as e:
+			logger.exception(e)
+	
+	def download_one_file(self, url, file_path, file_type, weibo_id):
+		"""下载单个文件(图片/视频)"""
+		try:
+			
+			file_exist = os.path.isfile(file_path)
+			need_download = (not file_exist)
+			if not need_download:
+				return
+			
+			s = requests.Session()
+			s.mount(url, HTTPAdapter(max_retries=5))
+			try_count = 0
+			success = False
+			MAX_TRY_COUNT = 3
+			while try_count < MAX_TRY_COUNT:
+				downloaded = s.get(
+					url, headers=self.headers, timeout=(5, 10), verify=False
+				)
+				try_count += 1
+				fail_flg_1 = url.endswith(("jpg", "jpeg")) and not downloaded.content.endswith(b"\xff\xd9")
+				fail_flg_2 = url.endswith("png") and not downloaded.content.endswith(b"\xaeB`\x82")
+				
+				if (fail_flg_1 or fail_flg_2):
+					logger.debug("[DEBUG] failed " + url + "  " + str(try_count))
+				else:
+					success = True
+					logger.debug("[DEBUG] success " + url + "  " + str(try_count))
+					break
+			
+			if success:
+				# 需要分别判断是否需要下载
+				if not file_exist:
+					with open(file_path, "wb") as f:
+						f.write(downloaded.content)
+						logger.debug("[DEBUG] save " + file_path)
+			else:
+				logger.debug("[DEBUG] failed " + url + " TOTALLY")
+		except Exception as e:
+			error_file = self.get_filepath(file_type) + os.sep + "not_downloaded.txt"
+			with open(error_file, "ab") as f:
+				url = str(weibo_id) + ":" + file_path + ":" + url + "\n"
+				f.write(url.encode(sys.stdout.encoding))
+			logger.exception(e)
+	
+	def handle_download(self, file_type, file_dir, urls, w):
+		"""处理下载相关操作"""
+		file_prefix = w["created_at"][:11].replace("-", "") + "_" + str(w["id"])
+		if file_type == "img":
+			if "," in urls:
+				url_list = urls.split(",")
+				for i, url in enumerate(url_list):
+					index = url.rfind(".")
+					if len(url) - index >= 5:
+						file_suffix = ".jpg"
+					else:
+						file_suffix = url[index:]
+					file_name = file_prefix + "_" + str(i + 1) + file_suffix
+					file_path = file_dir + os.sep + file_name
+					self.download_one_file(url, file_path, file_type, w["id"])
+			else:
+				index = urls.rfind(".")
+				if len(urls) - index > 5:
+					file_suffix = ".jpg"
+				else:
+					file_suffix = urls[index:]
+				file_name = file_prefix + file_suffix
+				file_path = file_dir + os.sep + file_name
+				self.download_one_file(urls, file_path, file_type, w["id"])
+		else:
+			file_suffix = ".mp4"
+			if ";" in urls:
+				url_list = urls.split(";")
+				if url_list[0].endswith(".mov"):
+					file_suffix = ".mov"
+				for i, url in enumerate(url_list):
+					file_name = file_prefix + "_" + str(i + 1) + file_suffix
+					file_path = file_dir + os.sep + file_name
+					self.download_one_file(url, file_path, file_type, w["id"])
+			else:
+				if urls.endswith(".mov"):
+					file_suffix = ".mov"
+				file_name = file_prefix + file_suffix
+				file_path = file_dir + os.sep + file_name
+				self.download_one_file(urls, file_path, file_type, w["id"])
+	
 	def write_data(self, wrote_count):
 		"""将爬到的信息写入文件或数据库"""
 		if self.got_count > wrote_count:
@@ -873,6 +989,10 @@ class WeiBoSpider(object):
 				self.write_csv(wrote_count)
 			if "json" in self.write_mode:
 				self.write_json(wrote_count)
+			if self.original_pic_download:
+				self.download_files("img", "original", wrote_count)
+			if self.original_video_download:
+				self.download_files("video", "original", wrote_count)
 	
 	# if "post" in self.write_mode:
 	# 	self.write_post(wrote_count)
@@ -886,11 +1006,6 @@ class WeiBoSpider(object):
 	# 	self.download_files("img", "original", wrote_count)
 	# if self.original_video_download:
 	# 	self.download_files("video", "original", wrote_count)
-	# if not self.only_crawl_original:
-	# 	if self.retweet_pic_download:
-	# 		self.download_files("img", "retweet", wrote_count)
-	# 	if self.retweet_video_download:
-	# 		self.download_files("video", "retweet", wrote_count)
 	
 	def update_user_config_file(self, user_config_file_path):
 		"""更新用户配置文件"""

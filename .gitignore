@@ -1,0 +1,9 @@
+# created by virtualenv automatically
+weibo/*
+js.json
+*.log
+*.pyc
+.DS_Store
+*.egg-info
+*.swp
+.idea
